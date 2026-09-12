@@ -10,14 +10,16 @@ from typing import Optional, List
 import uvicorn
 
 DB_PATH = "/root/cluster_chats.db"
-MAX_MESSAGES_PER_CHAT = 500  # Roll over to fresh chat after 40 messages (20 turns)
 
-# Worker state
-workers = {}       # { "u0": websocket, "u1": websocket, ... }
+# Threshold before branching to a fresh tab in Google AI Studio
+# Prevents browser DOM lag while maintaining context
+MAX_TURNS_PER_GOOGLE_THREAD = 300  
+
+workers = {}       # { "u0": websocket, ... }
 worker_info = {}   # { "u0": { "email": "...", "path": "..." } }
-worker_queue: List[str] = [] # Account rotation queue
+worker_queue: List[str] = []
 pending_requests = {}
-nav_futures = {}   # { "u0": Future } to await SPA page navigations
+nav_futures = {}
 
 def get_u_index(account_key: str) -> int:
     try:
@@ -33,7 +35,7 @@ async def ws_handler(websocket):
             msg_type = data.get("type")
 
             if msg_type == "REGISTER":
-                account_key = data.get("account_id", "u0") # e.g. "u0"
+                account_key = data.get("account_id", "u0")
                 workers[account_key] = websocket
                 worker_info[account_key] = {
                     "email": data.get("email"),
@@ -44,7 +46,6 @@ async def ws_handler(websocket):
                 print(f"🟢 Worker registered: [{account_key}] ({data.get('email')}) | Path: {data.get('path')}", flush=True)
                 await websocket.send(json.dumps({"status": "REGISTERED"}))
 
-                # Fulfill navigation wait if waiting for this worker to reload
                 if account_key in nav_futures and not nav_futures[account_key].done():
                     nav_futures[account_key].set_result(data.get("path"))
 
@@ -67,12 +68,9 @@ async def ws_handler(websocket):
     except Exception as e:
         print(f"⚠️ Worker [{account_key}] disconnected: {e}", flush=True)
     finally:
-        if account_key in workers:
-            del workers[account_key]
-        if account_key in worker_info:
-            del worker_info[account_key]
-        if account_key in worker_queue:
-            worker_queue.remove(account_key)
+        if account_key in workers: del workers[account_key]
+        if account_key in worker_info: del worker_info[account_key]
+        if account_key in worker_queue: worker_queue.remove(account_key)
         print(f"Active workers remaining: {list(workers.keys())}", flush=True)
 
 async def run_websocket_hub():
@@ -82,18 +80,20 @@ async def run_websocket_hub():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize Relational Database
     async with aiosqlite.connect(DB_PATH) as db:
+        # Chats table tracks permanent metadata
         await db.execute("""
             CREATE TABLE IF NOT EXISTS chats (
                 chat_id TEXT PRIMARY KEY,
                 account_id TEXT NOT NULL,
                 prompt_url TEXT NOT NULL,
-                message_count INTEGER DEFAULT 0,
+                thread_turn_count INTEGER DEFAULT 0,
+                total_messages INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Messages table is PERMANENT and NEVER pruned
         await db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,17 +111,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AI Studio 4-Worker Cluster", lifespan=lifespan)
 
-# Request Models
 class NewChatRequest(BaseModel):
     chat_id: Optional[str] = None
-    account: Optional[str] = None # e.g. "u0", "u1" or None for auto-balance
+    account: Optional[str] = None
 
 class ChatRequest(BaseModel):
     chat_id: Optional[str] = None
-    session_id: Optional[str] = None # Backward compatibility
+    session_id: Optional[str] = None
     prompt: str
 
-# Helper: navigate worker to URL and wait for reload
 async def navigate_worker(account_key: str, target_url: str):
     ws = workers.get(account_key)
     if not ws:
@@ -149,7 +147,6 @@ async def create_new_chat(req: NewChatRequest):
 
     chat_id = req.chat_id or f"chat_{uuid.uuid4().hex[:10]}"
 
-    # Pick account
     assigned_account = req.account
     if not assigned_account or assigned_account not in workers:
         assigned_account = worker_queue[0]
@@ -160,27 +157,25 @@ async def create_new_chat(req: NewChatRequest):
     new_chat_url = f"https://aistudio.google.com/u/{u_idx}/prompts/new_chat?model=gemini-3.5-flash-lite"
     db_prompt_path = f"/u/{u_idx}/prompts/new_chat?model=gemini-3.5-flash-lite"
 
-    # Save to SQLite
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
-            INSERT INTO chats (chat_id, account_id, prompt_url, message_count)
-            VALUES (?, ?, ?, 0)
+            INSERT INTO chats (chat_id, account_id, prompt_url, thread_turn_count, total_messages)
+            VALUES (?, ?, ?, 0, 0)
             ON CONFLICT(chat_id) DO UPDATE SET 
                 account_id = excluded.account_id,
                 prompt_url = excluded.prompt_url,
-                message_count = 0,
+                thread_turn_count = 0,
                 updated_at = CURRENT_TIMESTAMP
         """, (chat_id, assigned_account, db_prompt_path))
         await db.commit()
 
-    # Direct worker to new chat URL
     await navigate_worker(assigned_account, new_chat_url)
 
     return {
         "chat_id": chat_id,
         "account_assigned": assigned_account,
         "prompt_url": db_prompt_path,
-        "message": "New chat created and initialized."
+        "message": "New chat initialized."
     }
 
 # 2. CHAT & EXECUTE ENDPOINT
@@ -191,40 +186,53 @@ async def chat(req: ChatRequest):
 
     chat_id = req.chat_id or req.session_id or f"chat_{uuid.uuid4().hex[:10]}"
 
-    # Check if chat exists in SQLite
+    # Fetch existing chat
     chat_record = None
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT account_id, prompt_url, message_count FROM chats WHERE chat_id = ?", (chat_id,)) as cur:
+        async with db.execute("SELECT account_id, prompt_url, thread_turn_count, total_messages FROM chats WHERE chat_id = ?", (chat_id,)) as cur:
             chat_record = await cur.fetchone()
 
-    # If new chat, initialize it
+    is_rollover = False
+
     if not chat_record:
         assigned_account = worker_queue[0]
         worker_queue.remove(assigned_account)
         worker_queue.append(assigned_account)
         u_idx = get_u_index(assigned_account)
         prompt_url = f"/u/{u_idx}/prompts/new_chat?model=gemini-3.5-flash-lite"
-        message_count = 0
+        thread_turn_count = 0
+        total_messages = 0
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
-                INSERT INTO chats (chat_id, account_id, prompt_url, message_count)
-                VALUES (?, ?, ?, 0)
+                INSERT INTO chats (chat_id, account_id, prompt_url, thread_turn_count, total_messages)
+                VALUES (?, ?, ?, 0, 0)
             """, (chat_id, assigned_account, prompt_url))
             await db.commit()
     else:
-        assigned_account, prompt_url, message_count = chat_record
+        assigned_account, prompt_url, thread_turn_count, total_messages = chat_record
 
-    # AUTO-ROLLOVER: If conversation has grown too long, start a fresh Google chat thread
-    if message_count >= MAX_MESSAGES_PER_CHAT:
-        print(f"⚠️ Chat [{chat_id}] reached {message_count} messages. Rolling over to a fresh Google chat thread...", flush=True)
+    # SMART CONTEXT SYNC: If the thread in Google AI Studio is too long, branch to a fresh thread
+    if thread_turn_count >= MAX_TURNS_PER_GOOGLE_THREAD:
+        print(f"📦 Chat [{chat_id}] reached {thread_turn_count} turns in current thread. Rolling over to fresh UI...", flush=True)
         u_idx = get_u_index(assigned_account)
         fresh_url = f"https://aistudio.google.com/u/{u_idx}/prompts/new_chat?model=gemini-3.5-flash-lite"
         await navigate_worker(assigned_account, fresh_url)
         prompt_url = f"/u/{u_idx}/prompts/new_chat?model=gemini-3.5-flash-lite"
-        message_count = 0
+        thread_turn_count = 0
+        is_rollover = True
 
-    # Build priority list for execution and failover
+    # Build prompt payload (if rolled over, inject compact summary of last 4 turns from SQLite)
+    effective_prompt = req.prompt
+    if is_rollover:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT 6", (chat_id,)) as cur:
+                recent_rows = await cur.fetchall()
+                if recent_rows:
+                    recent_rows.reverse()
+                    summary = "\n".join([f"{r[0].capitalize()}: {r[1]}" for r in recent_rows])
+                    effective_prompt = f"[Prior Context Summary]\n{summary}\n\n[User]: {req.prompt}"
+
     candidate_accounts = [acc for acc in worker_queue if acc in workers]
     if assigned_account in candidate_accounts:
         candidate_accounts.remove(assigned_account)
@@ -234,17 +242,14 @@ async def chat(req: ChatRequest):
 
     for account_key in candidate_accounts:
         ws = workers.get(account_key)
-        if not ws:
-            continue
+        if not ws: continue
 
-        # If switching accounts on failover, adjust URL index
         if account_key != assigned_account:
             u_idx = get_u_index(account_key)
             current_target_url = f"/u/{u_idx}/prompts/new_chat?model=gemini-3.5-flash-lite"
         else:
             current_target_url = prompt_url
 
-        # Check if browser worker needs to navigate to the chat's URL
         current_worker_path = worker_info.get(account_key, {}).get("path", "")
         if current_target_url not in current_worker_path and "new_chat" not in current_target_url:
             print(f"Navigating [{account_key}] to resume chat: {current_target_url}...", flush=True)
@@ -259,7 +264,7 @@ async def chat(req: ChatRequest):
             await ws.send(json.dumps({
                 "id": req_id,
                 "action": "EXECUTE",
-                "prompt": req.prompt
+                "prompt": effective_prompt
             }))
 
             res = await asyncio.wait_for(fut, timeout=90.0)
@@ -270,18 +275,21 @@ async def chat(req: ChatRequest):
 
             new_path = res.get("path")
 
-            # Store turn in SQLite
+            # PERMANENT INSERTION INTO SQLITE
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("INSERT INTO messages (chat_id, role, content) VALUES (?, 'user', ?)", (chat_id, req.prompt))
                 await db.execute("INSERT INTO messages (chat_id, role, content) VALUES (?, 'model', ?)", (chat_id, reply_text))
                 await db.execute("""
                     UPDATE chats 
-                    SET account_id = ?, prompt_url = ?, message_count = message_count + 2, updated_at = CURRENT_TIMESTAMP
+                    SET account_id = ?, 
+                        prompt_url = ?, 
+                        thread_turn_count = thread_turn_count + 1, 
+                        total_messages = total_messages + 2, 
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE chat_id = ?
                 """, (account_key, new_path, chat_id))
                 await db.commit()
 
-            # Rotate queue
             worker_queue.remove(account_key)
             worker_queue.append(account_key)
 
@@ -289,7 +297,7 @@ async def chat(req: ChatRequest):
                 "chat_id": chat_id,
                 "account_used": account_key,
                 "prompt_url": new_path,
-                "message_count": message_count + 2,
+                "total_messages_saved": total_messages + 2,
                 "response": reply_text
             }
 
@@ -300,18 +308,17 @@ async def chat(req: ChatRequest):
             if account_key in worker_queue:
                 worker_queue.remove(account_key)
                 worker_queue.append(account_key)
-            print("🔄 Failing over to next account...", flush=True)
             continue
         finally:
             pending_requests.pop(req_id, None)
 
     raise HTTPException(status_code=500, detail=f"All workers failed. Last error: {last_err}")
 
-# 3. GET CHAT TRANSCRIPT ENDPOINT
+# 3. GET FULL TRANSCRIPT (Returns all saved messages from SQLite)
 @app.get("/v1/chat/{chat_id}")
 async def get_chat_history(chat_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT account_id, prompt_url, message_count, updated_at FROM chats WHERE chat_id = ?", (chat_id,)) as cur:
+        async with db.execute("SELECT account_id, prompt_url, thread_turn_count, total_messages, updated_at FROM chats WHERE chat_id = ?", (chat_id,)) as cur:
             chat_info = await cur.fetchone()
             if not chat_info:
                 raise HTTPException(status_code=404, detail="Chat ID not found")
@@ -323,8 +330,8 @@ async def get_chat_history(chat_id: str):
         "chat_id": chat_id,
         "account_id": chat_info[0],
         "prompt_url": chat_info[1],
-        "message_count": chat_info[2],
-        "last_updated": chat_info[3],
+        "total_messages_in_db": chat_info[3],
+        "last_updated": chat_info[4],
         "messages": messages
     }
 
